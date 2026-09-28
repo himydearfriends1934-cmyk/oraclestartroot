@@ -1,32 +1,8 @@
-```bash
 #!/usr/bin/env bash
-
-# ============================================================
-# OCI Root SSH Key Login Configurator
-#
-# Supported:
-#   Ubuntu / Debian / Oracle Linux / RHEL-like systems
-#
-# Features:
-#   - Backup SSH configuration before modification
-#   - Detect the current login user automatically
-#   - Copy the user's authorized_keys to root
-#   - Remove OCI-style command="..." login restriction
-#   - Configure PermitRootLogin prohibit-password
-#   - Disable SSH PasswordAuthentication
-#   - Update cloud-init root restriction where applicable
-#   - Fix permissions and SELinux context
-#   - Validate sshd configuration BEFORE restarting SSH
-#
-# IMPORTANT:
-#   Keep the current SSH session open until root login has
-#   been successfully tested from another terminal.
-# ============================================================
 
 set -Eeuo pipefail
 
-SCRIPT_NAME="oci-root-ssh"
-BACKUP_DIR="/root/${SCRIPT_NAME}-backup-$(date +%Y%m%d-%H%M%S)"
+BACKUP_DIR="/root/oci-root-ssh-backup-$(date +%Y%m%d-%H%M%S)"
 
 log() {
     echo
@@ -44,24 +20,9 @@ die() {
     exit 1
 }
 
-cleanup_on_error() {
-    local rc=$?
-
-    echo
-    echo "[ERROR] Script failed with exit code ${rc}."
-    echo "[ERROR] Your current SSH session has NOT been intentionally closed."
-    echo "[ERROR] Backups are available at:"
-    echo "        ${BACKUP_DIR}"
-    echo
-
-    exit "$rc"
-}
-
-trap cleanup_on_error ERR
-
-# ------------------------------------------------------------
-# 1. Root check
-# ------------------------------------------------------------
+# ============================================================
+# Root check
+# ============================================================
 
 if [[ "${EUID}" -ne 0 ]]; then
     exec sudo -E bash "$0" "$@"
@@ -71,340 +32,193 @@ echo "============================================================"
 echo " OCI Root SSH Key Login Configurator"
 echo "============================================================"
 echo
-echo "Backup directory:"
-echo "  ${BACKUP_DIR}"
-echo
 
-mkdir -p "${BACKUP_DIR}"
-chmod 700 "${BACKUP_DIR}"
+# ============================================================
+# Backup directory
+# ============================================================
 
-# ------------------------------------------------------------
-# 2. Detect OS
-# ------------------------------------------------------------
+mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
 
-OS_ID=""
-OS_VERSION=""
+log "Backup directory: $BACKUP_DIR"
 
-if [[ -r /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    source /etc/os-release
-    OS_ID="${ID:-unknown}"
-    OS_VERSION="${VERSION_ID:-unknown}"
-fi
+# ============================================================
+# Detect source user
+# ============================================================
 
-log "Detected OS: ${OS_ID} ${OS_VERSION}"
-
-# ------------------------------------------------------------
-# 3. Detect current SSH/login user
-# ------------------------------------------------------------
-
-CURRENT_USER="${SUDO_USER:-}"
-
-if [[ -z "${CURRENT_USER}" || "${CURRENT_USER}" == "root" ]]; then
-    CURRENT_USER=""
-
-    # Try SSH connection information first.
-    if [[ -n "${SSH_CONNECTION:-}" ]]; then
-        # SSH_CONNECTION contains:
-        # client_ip client_port server_ip server_port
-        :
-    fi
-
-    # Fall back to common OCI users.
-    for candidate in ubuntu opc debian ec2-user admin rocky almalinux; do
-        if id "${candidate}" >/dev/null 2>&1 &&
-           [[ -f "/home/${candidate}/.ssh/authorized_keys" ]]; then
-            CURRENT_USER="${candidate}"
-            break
-        fi
-    done
-fi
-
-# ------------------------------------------------------------
-# 4. Find authorized_keys source
-# ------------------------------------------------------------
-
+SOURCE_USER=""
 SOURCE_AUTHORIZED_KEYS=""
 
-if [[ -n "${CURRENT_USER}" ]]; then
-    candidate="/home/${CURRENT_USER}/.ssh/authorized_keys"
+# If executed through sudo, SUDO_USER is usually the original user.
+if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
 
-    if [[ -f "${candidate}" ]]; then
-        SOURCE_AUTHORIZED_KEYS="${candidate}"
+    if [[ -f "/home/${SUDO_USER}/.ssh/authorized_keys" ]]; then
+        SOURCE_USER="${SUDO_USER}"
+        SOURCE_AUTHORIZED_KEYS="/home/${SUDO_USER}/.ssh/authorized_keys"
     fi
+
 fi
 
-# If automatic detection failed, search common home directories.
-if [[ -z "${SOURCE_AUTHORIZED_KEYS}" ]]; then
-    for candidate in \
-        /home/ubuntu/.ssh/authorized_keys \
-        /home/opc/.ssh/authorized_keys \
-        /home/debian/.ssh/authorized_keys \
-        /home/admin/.ssh/authorized_keys \
-        /home/ec2-user/.ssh/authorized_keys
+# Try common OCI/Linux users.
+if [[ -z "$SOURCE_AUTHORIZED_KEYS" ]]; then
+
+    for user in \
+        ubuntu \
+        opc \
+        debian \
+        ec2-user \
+        admin \
+        rocky \
+        almalinux
     do
-        if [[ -f "${candidate}" ]]; then
-            SOURCE_AUTHORIZED_KEYS="${candidate}"
-            CURRENT_USER="$(basename "$(dirname "$(dirname "${candidate}")")")"
+
+        if [[ -f "/home/${user}/.ssh/authorized_keys" ]]; then
+            SOURCE_USER="${user}"
+            SOURCE_AUTHORIZED_KEYS="/home/${user}/.ssh/authorized_keys"
             break
         fi
+
     done
+
 fi
 
-if [[ -z "${SOURCE_AUTHORIZED_KEYS}" ]]; then
-    die "Could not find a source authorized_keys file."
+if [[ -z "$SOURCE_AUTHORIZED_KEYS" ]]; then
+    die "Could not find a user's authorized_keys file."
 fi
 
-log "Source user: ${CURRENT_USER}"
-log "Source key file: ${SOURCE_AUTHORIZED_KEYS}"
-
-# ------------------------------------------------------------
-# 5. Validate source key file
-# ------------------------------------------------------------
-
-if [[ ! -s "${SOURCE_AUTHORIZED_KEYS}" ]]; then
+if [[ ! -s "$SOURCE_AUTHORIZED_KEYS" ]]; then
     die "Source authorized_keys exists but is empty."
 fi
 
-# Backup source key.
+log "Source user: $SOURCE_USER"
+log "Source key file: $SOURCE_AUTHORIZED_KEYS"
+
+# ============================================================
+# Backup source authorized_keys
+# ============================================================
+
 cp -a \
-    "${SOURCE_AUTHORIZED_KEYS}" \
-    "${BACKUP_DIR}/authorized_keys.${CURRENT_USER}.bak"
+    "$SOURCE_AUTHORIZED_KEYS" \
+    "$BACKUP_DIR/authorized_keys.${SOURCE_USER}.bak"
 
-# ------------------------------------------------------------
-# 6. Backup root SSH configuration
-# ------------------------------------------------------------
-
-mkdir -p "${BACKUP_DIR}/ssh"
+# ============================================================
+# Backup SSH configuration
+# ============================================================
 
 if [[ -f /etc/ssh/sshd_config ]]; then
     cp -a \
         /etc/ssh/sshd_config \
-        "${BACKUP_DIR}/ssh/sshd_config.bak"
+        "$BACKUP_DIR/sshd_config.bak"
 fi
 
 if [[ -d /etc/ssh/sshd_config.d ]]; then
     cp -a \
         /etc/ssh/sshd_config.d \
-        "${BACKUP_DIR}/sshd_config.d.bak"
+        "$BACKUP_DIR/sshd_config.d.bak"
 fi
 
 if [[ -f /etc/cloud/cloud.cfg ]]; then
     cp -a \
         /etc/cloud/cloud.cfg \
-        "${BACKUP_DIR}/cloud.cfg.bak"
+        "$BACKUP_DIR/cloud.cfg.bak"
 fi
 
-# ------------------------------------------------------------
-# 7. Create root SSH directory
-# ------------------------------------------------------------
+# ============================================================
+# Prepare /root/.ssh
+# ============================================================
 
 log "Preparing /root/.ssh"
 
-mkdir -p /root/.ssh
+install \
+    -d \
+    -m 700 \
+    -o root \
+    -g root \
+    /root/.ssh
 
-chmod 700 /root/.ssh
-chown root:root /root/.ssh
+# ============================================================
+# Copy authorized_keys
+# ============================================================
 
-# ------------------------------------------------------------
-# 8. Copy authorized_keys
-# ------------------------------------------------------------
-
-log "Copying SSH public keys to root"
+log "Copying authorized_keys to root"
 
 cp -f \
-    "${SOURCE_AUTHORIZED_KEYS}" \
+    "$SOURCE_AUTHORIZED_KEYS" \
     /root/.ssh/authorized_keys
 
-chown root:root /root/.ssh/authorized_keys
-chmod 600 /root/.ssh/authorized_keys
+# ============================================================
+# Remove OCI command="..." restriction
+# ============================================================
+#
+# OCI public keys can look like:
+#
+# command="echo Please login as the user..." ssh-rsa AAAA...
+#
+# or:
+#
+# command="..." ssh-ed25519 AAAA...
+#
+# This removes the command option while keeping the actual
+# SSH public key.
+#
+# This version intentionally does NOT use Perl.
+# ============================================================
 
-# ------------------------------------------------------------
-# 9. Remove OCI command="..." restriction
-#
-# We only remove the command option at the beginning of a key
-# entry. Other SSH options are intentionally preserved.
-#
-# Example:
-#
-# command="echo Please login as the user opc..." ssh-rsa AAAA...
-#
-# becomes:
-#
-# ssh-rsa AAAA...
-#
-# If a line contains:
-#
-# from="1.2.3.4",command="..." ssh-ed25519 AAAA...
-#
-# it becomes:
-#
-# from="1.2.3.4" ssh-ed25519 AAAA...
-#
-# ------------------------------------------------------------
-
-log "Cleaning OCI command restrictions from authorized_keys"
+log "Cleaning OCI command restrictions"
 
 CLEANED_KEYS="/root/.ssh/authorized_keys.cleaned"
 
-if command -v perl >/dev/null 2>&1; then
+sed -E \
+    's/^command="[^"]*"[[:space:]]*,?[[:space:]]*//' \
+    "$SOURCE_AUTHORIZED_KEYS" \
+    > "$CLEANED_KEYS"
 
-    perl -pe '
-        # Remove an OpenSSH command="..." option.
-        # Handles escaped characters inside double quotes.
-        s/(^|,)\s*command="(?:\\.|[^"\\])*"\s*,?/$1/;
-        s/^\s*,//;
-        s/,\s+ssh-/ ssh-/;
-        s/,\s+(ecdsa-|sk-|ssh-)/ $1/;
-    ' \
-    /root/.ssh/authorized_keys > "${CLEANED_KEYS}"
-
-else
-
-    warn "perl is not installed; using conservative fallback."
-
-    # Conservative fallback:
-    # Only remove a command option when it is the first option.
-    sed -E \
-        's/^command="([^"\\]|\\.)*"[, ]+//' \
-        /root/.ssh/authorized_keys > "${CLEANED_KEYS}"
-fi
-
-if [[ ! -s "${CLEANED_KEYS}" ]]; then
+if [[ ! -s "$CLEANED_KEYS" ]]; then
+    rm -f "$CLEANED_KEYS"
     die "Key cleanup produced an empty authorized_keys file."
 fi
 
-mv -f "${CLEANED_KEYS}" /root/.ssh/authorized_keys
+mv -f \
+    "$CLEANED_KEYS" \
+    /root/.ssh/authorized_keys
 
-chown root:root /root/.ssh/authorized_keys
-chmod 600 /root/.ssh/authorized_keys
-
-# ------------------------------------------------------------
-# 10. Remove accidental duplicate blank lines
-# ------------------------------------------------------------
-
+# Remove blank lines.
 sed -i '/^[[:space:]]*$/d' /root/.ssh/authorized_keys
 
-# ------------------------------------------------------------
-# 11. SELinux context
-# ------------------------------------------------------------
+# ============================================================
+# Root SSH permissions
+# ============================================================
+
+chown root:root /root/.ssh
+chown root:root /root/.ssh/authorized_keys
+
+chmod 700 /root/.ssh
+chmod 600 /root/.ssh/authorized_keys
+
+# ============================================================
+# SELinux
+# ============================================================
 
 if command -v restorecon >/dev/null 2>&1; then
+
     log "Restoring SELinux context"
-    restorecon -RF /root/.ssh >/dev/null 2>&1 || true
+
+    restorecon \
+        -RF \
+        /root/.ssh \
+        >/dev/null 2>&1 || true
+
 fi
 
-# ------------------------------------------------------------
-# 12. Configure SSH
-# ------------------------------------------------------------
+# ============================================================
+# Check sshd
+# ============================================================
 
 SSHD_CONFIG="/etc/ssh/sshd_config"
 
-if [[ ! -f "${SSHD_CONFIG}" ]]; then
-    die "Cannot find ${SSHD_CONFIG}"
+if [[ ! -f "$SSHD_CONFIG" ]]; then
+    die "Cannot find $SSHD_CONFIG"
 fi
-
-log "Configuring SSH"
-
-# Remove active or commented duplicate global directives from
-# the main configuration.
-#
-# We then append our explicit settings.
-#
-# This is intentionally limited to the two directives we own.
-
-sed -i \
-    -E \
-    '/^[[:space:]]*#?[[:space:]]*PermitRootLogin[[:space:]]+/d' \
-    "${SSHD_CONFIG}"
-
-sed -i \
-    -E \
-    '/^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+/d' \
-    "${SSHD_CONFIG}"
-
-cat >> "${SSHD_CONFIG}" <<'EOF'
-
-# ============================================================
-# OCI Root SSH Key Login
-# Managed by oci-root-ssh
-# ============================================================
-
-PermitRootLogin prohibit-password
-PasswordAuthentication no
-
-EOF
-
-# ------------------------------------------------------------
-# 13. Deal with sshd_config.d
-#
-# Remove conflicting global directives from drop-in files.
-# We do NOT delete arbitrary SSH configuration.
-# ------------------------------------------------------------
-
-if [[ -d /etc/ssh/sshd_config.d ]]; then
-
-    while IFS= read -r -d '' file; do
-
-        # Skip our own potential generated file.
-        [[ "${file}" == */99-oci-root-ssh.conf ]] && continue
-
-        # Remove only the directives controlled by this script.
-        sed -i \
-            -E \
-            '/^[[:space:]]*#?[[:space:]]*PermitRootLogin[[:space:]]+/d' \
-            "${file}" 2>/dev/null || true
-
-        sed -i \
-            -E \
-            '/^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+/d' \
-            "${file}" 2>/dev/null || true
-
-    done < <(find /etc/ssh/sshd_config.d -maxdepth 1 -type f -name '*.conf' -print0)
-fi
-
-# ------------------------------------------------------------
-# 14. Configure cloud-init
-# ------------------------------------------------------------
-
-if [[ -f /etc/cloud/cloud.cfg ]]; then
-
-    log "Checking cloud-init root configuration"
-
-    # Replace common forms:
-    #
-    # disable_root: true
-    # disable_root: 1
-    #
-    # with:
-    #
-    # disable_root: false
-    #
-
-    if grep -Eq '^[[:space:]]*disable_root:' /etc/cloud/cloud.cfg; then
-
-        sed -i \
-            -E \
-            's/^[[:space:]]*disable_root:[[:space:]]*.*/disable_root: false/' \
-            /etc/cloud/cloud.cfg
-
-    else
-
-        cat >> /etc/cloud/cloud.cfg <<'EOF'
-
-# Allow root SSH access configured by oci-root-ssh.
-disable_root: false
-EOF
-
-    fi
-
-else
-    warn "/etc/cloud/cloud.cfg not found; skipping cloud-init configuration."
-fi
-
-# ------------------------------------------------------------
-# 15. Find sshd binary
-# ------------------------------------------------------------
 
 SSHD_BIN=""
 
@@ -414,75 +228,268 @@ elif [[ -x /usr/sbin/sshd ]]; then
     SSHD_BIN="/usr/sbin/sshd"
 fi
 
-if [[ -z "${SSHD_BIN}" ]]; then
+if [[ -z "$SSHD_BIN" ]]; then
     die "sshd binary not found."
 fi
 
-log "Using SSH daemon: ${SSHD_BIN}"
+log "Using SSH daemon: $SSHD_BIN"
 
-# ------------------------------------------------------------
-# 16. Validate SSH configuration
-# ------------------------------------------------------------
+# ============================================================
+# Configure main sshd_config
+# ============================================================
+
+log "Configuring SSH"
+
+# Remove existing PermitRootLogin directives.
+sed -i -E \
+    '/^[[:space:]]*#?[[:space:]]*PermitRootLogin[[:space:]]+/d' \
+    "$SSHD_CONFIG"
+
+# Remove existing PasswordAuthentication directives.
+sed -i -E \
+    '/^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+/d' \
+    "$SSHD_CONFIG"
+
+cat >> "$SSHD_CONFIG" <<'EOF'
+
+# ============================================================
+# OCI Root SSH Key Login
+# Managed by oci-root-ssh
+# ============================================================
+
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+EOF
+
+# ============================================================
+# Configure sshd_config.d
+# ============================================================
+
+if [[ -d /etc/ssh/sshd_config.d ]]; then
+
+    log "Checking SSH drop-in configuration"
+
+    while IFS= read -r -d '' file; do
+
+        # Do not modify our own generated file here.
+        if [[ "$file" == "/etc/ssh/sshd_config.d/99-oci-root-ssh.conf" ]]; then
+            continue
+        fi
+
+        # Remove conflicting directives.
+        sed -i -E \
+            '/^[[:space:]]*#?[[:space:]]*PermitRootLogin[[:space:]]+/d' \
+            "$file" \
+            2>/dev/null || true
+
+        sed -i -E \
+            '/^[[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+/d' \
+            "$file" \
+            2>/dev/null || true
+
+    done < <(
+        find \
+            /etc/ssh/sshd_config.d \
+            -maxdepth 1 \
+            -type f \
+            -name '*.conf' \
+            -print0
+    )
+
+    # Create a final drop-in.
+    cat > /etc/ssh/sshd_config.d/99-oci-root-ssh.conf <<'EOF'
+# ============================================================
+# OCI Root SSH Key Login
+# Managed by oci-root-ssh
+# ============================================================
+
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+EOF
+
+fi
+
+# ============================================================
+# cloud-init
+# ============================================================
+
+if [[ -f /etc/cloud/cloud.cfg ]]; then
+
+    log "Checking cloud-init configuration"
+
+    if grep -Eq \
+        '^[[:space:]]*disable_root[[:space:]]*:' \
+        /etc/cloud/cloud.cfg
+    then
+
+        sed -i -E \
+            's/^[[:space:]]*disable_root[[:space:]]*:.*/disable_root: false/' \
+            /etc/cloud/cloud.cfg
+
+    else
+
+        warn "disable_root was not found in cloud.cfg."
+        warn "Leaving cloud-init configuration unchanged."
+
+    fi
+
+else
+
+    warn "/etc/cloud/cloud.cfg not found."
+    warn "Skipping cloud-init configuration."
+
+fi
+
+# ============================================================
+# Validate SSH configuration BEFORE restart
+# ============================================================
 
 log "Validating SSH configuration"
 
-if ! "${SSHD_BIN}" -t; then
+if ! "$SSHD_BIN" -t; then
 
-    warn "sshd configuration validation FAILED."
+    warn "sshd -t FAILED."
     warn "Restoring previous SSH configuration."
 
-    if [[ -f "${BACKUP_DIR}/ssh/sshd_config.bak" ]]; then
+    if [[ -f "$BACKUP_DIR/sshd_config.bak" ]]; then
+
         cp -af \
-            "${BACKUP_DIR}/ssh/sshd_config.bak" \
+            "$BACKUP_DIR/sshd_config.bak" \
             /etc/ssh/sshd_config
+
     fi
 
-    if [[ -d "${BACKUP_DIR}/sshd_config.d.bak" ]]; then
+    if [[ -d "$BACKUP_DIR/sshd_config.d.bak" ]]; then
+
         rm -rf /etc/ssh/sshd_config.d
 
         cp -a \
-            "${BACKUP_DIR}/sshd_config.d.bak" \
+            "$BACKUP_DIR/sshd_config.d.bak" \
             /etc/ssh/sshd_config.d
+
     fi
 
-    die "SSH configuration was invalid. Original configuration restored."
+    if [[ -f "$BACKUP_DIR/cloud.cfg.bak" ]]; then
+
+        cp -af \
+            "$BACKUP_DIR/cloud.cfg.bak" \
+            /etc/cloud/cloud.cfg
+
+    fi
+
+    "$SSHD_BIN" -t || true
+
+    die "SSH configuration was invalid. Original SSH configuration was restored."
+
 fi
 
-log "SSH configuration syntax is valid."
+log "sshd configuration syntax is valid."
 
-# ------------------------------------------------------------
-# 17. Show effective SSH configuration
-# ------------------------------------------------------------
+# ============================================================
+# Show effective configuration
+# ============================================================
 
-log "Effective SSH settings"
+log "Effective SSH configuration"
 
-EFFECTIVE_CONFIG="$("${SSHD_BIN}" -T 2>/dev/null || true)"
+EFFECTIVE_CONFIG="$(
+    "$SSHD_BIN" -T 2>/dev/null || true
+)"
 
-echo "${EFFECTIVE_CONFIG}" | grep -E \
-    '^(permitrootlogin|passwordauthentication|pubkeyauthentication) ' \
+echo "$EFFECTIVE_CONFIG" |
+    grep -E \
+        '^(permitrootlogin|passwordauthentication|pubkeyauthentication) ' \
     || true
 
-# ------------------------------------------------------------
-# 18. Verify required settings
-# ------------------------------------------------------------
+echo
 
-if ! echo "${EFFECTIVE_CONFIG}" |
+# ============================================================
+# Verify important settings
+# ============================================================
+
+if echo "$EFFECTIVE_CONFIG" |
     grep -q '^permitrootlogin prohibit-password$'
 then
+
+    echo "[OK] PermitRootLogin = prohibit-password"
+
+else
+
     warn "Effective PermitRootLogin is not prohibit-password."
-    warn "The system may have another SSH configuration source."
+
 fi
 
-if ! echo "${EFFECTIVE_CONFIG}" |
+if echo "$EFFECTIVE_CONFIG" |
     grep -q '^passwordauthentication no$'
 then
+
+    echo "[OK] PasswordAuthentication = no"
+
+else
+
     warn "Effective PasswordAuthentication is not no."
-    warn "The system may have another SSH configuration source."
+
 fi
 
-# ------------------------------------------------------------
-# 19. Fix permissions one more time
-# ------------------------------------------------------------
+if echo "$EFFECTIVE_CONFIG" |
+    grep -q '^pubkeyauthentication yes$'
+then
+
+    echo "[OK] PubkeyAuthentication = yes"
+
+else
+
+    warn "Effective PubkeyAuthentication is not yes."
+
+fi
+
+# ============================================================
+# Restart SSH service
+# ============================================================
+
+SSH_SERVICE=""
+
+if systemctl list-unit-files 2>/dev/null |
+    grep -q '^sshd\.service'
+then
+
+    SSH_SERVICE="sshd"
+
+elif systemctl list-unit-files 2>/dev/null |
+    grep -q '^ssh\.service'
+then
+
+    SSH_SERVICE="ssh"
+
+fi
+
+if [[ -z "$SSH_SERVICE" ]]; then
+
+    warn "Could not determine SSH service name."
+    warn "SSH configuration was validated but the service was not restarted."
+
+else
+
+    log "Restarting SSH service: $SSH_SERVICE"
+
+    if ! systemctl restart "$SSH_SERVICE"; then
+
+        die "Failed to restart $SSH_SERVICE. Keep this SSH session open."
+
+    fi
+
+    if ! systemctl is-active --quiet "$SSH_SERVICE"; then
+
+        die "$SSH_SERVICE is not active after restart."
+
+    fi
+
+    log "SSH service is active."
+
+fi
+
+# ============================================================
+# Final permissions
+# ============================================================
 
 chmod 700 /root/.ssh
 chmod 600 /root/.ssh/authorized_keys
@@ -494,67 +501,31 @@ if command -v restorecon >/dev/null 2>&1; then
     restorecon -RF /root/.ssh >/dev/null 2>&1 || true
 fi
 
-# ------------------------------------------------------------
-# 20. Restart SSH
-# ------------------------------------------------------------
-
-log "Restarting SSH service"
-
-SSH_SERVICE=""
-
-if systemctl list-unit-files 2>/dev/null |
-    grep -q '^sshd\.service'
-then
-    SSH_SERVICE="sshd"
-elif systemctl list-unit-files 2>/dev/null |
-    grep -q '^ssh\.service'
-then
-    SSH_SERVICE="ssh"
-fi
-
-if [[ -n "${SSH_SERVICE}" ]]; then
-
-    if ! systemctl restart "${SSH_SERVICE}"; then
-        die "Failed to restart ${SSH_SERVICE}. Keep this SSH session open and inspect the service."
-    fi
-
-else
-
-    warn "Could not automatically determine SSH service name."
-    warn "Configuration has been validated, but SSH was not restarted."
-fi
-
-# ------------------------------------------------------------
-# 21. Final verification
-# ------------------------------------------------------------
-
-if systemctl is-active --quiet "${SSH_SERVICE:-sshd}" 2>/dev/null; then
-    log "SSH service is active."
-fi
+# ============================================================
+# Complete
+# ============================================================
 
 echo
 echo "============================================================"
-echo " Configuration completed"
+echo " Configuration completed successfully"
 echo "============================================================"
 echo
-echo "Root SSH key file:"
+echo "Root SSH key:"
 echo "  /root/.ssh/authorized_keys"
 echo
-echo "SSH configuration:"
+echo "SSH settings:"
 echo "  PermitRootLogin prohibit-password"
 echo "  PasswordAuthentication no"
 echo
 echo "Backup:"
-echo "  ${BACKUP_DIR}"
+echo "  $BACKUP_DIR"
 echo
 echo "IMPORTANT:"
 echo "  DO NOT close this SSH session yet."
 echo
-echo "From another terminal, test:"
+echo "Open another terminal and test:"
 echo
-echo "  ssh root@<SERVER_IP>"
+echo "  ssh root@YOUR_SERVER_IP"
 echo
-echo "If root login works, the configuration is ready."
-echo
+echo "After root login succeeds, you can close this session."
 echo "============================================================"
-```
